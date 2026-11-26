@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import cv2
 import numpy as np
+import onnxruntime
+import torch
 
+from lib.config import settings
+from lib.preprocessing import preprocess_bgr_batch, preprocess_bgr_numpy
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
+from lib.splits import normalize_breed_name
 
 logger = logging.getLogger(__name__)
 
@@ -62,29 +68,116 @@ class DetectionService:
     # Etapa 3: funciones a implementar
     # ------------------------------------------------------------------
 
+    def _get_yolo(self) -> Any:
+        cached = getattr(self, "_yolo", None)
+        if cached is not None:
+            return cached
+
+        from ultralytics import YOLO
+
+        model_path = Path(self.yolo_model_name)
+        if model_path.parent != Path("."):
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+        self._yolo = YOLO(self.yolo_model_name)
+        logger.info("Detector YOLO cargado: %s", self.yolo_model_name)
+        return self._yolo
+
+    def _resolve_classes(self, model: Any) -> list[str]:
+        if isinstance(model, onnxruntime.InferenceSession):
+            raw = model.get_modelmeta().custom_metadata_map.get("classes")
+            if raw:
+                return list(json.loads(raw))
+        else:
+            model_classes = getattr(model, "classes", None)
+            if model_classes:
+                return list(model_classes)
+
+        train_dir = self.classifier.dataset_path / "train"
+        if train_dir.is_dir():
+            classes = sorted(
+                normalize_breed_name(p.name) for p in train_dir.iterdir() if p.is_dir()
+            )
+            if classes:
+                return classes
+
+        raise ValueError(
+            "El checkpoint cargado no contiene la lista de razas (.classes / metadata) "
+            f"y no se encontro {train_dir}."
+        )
+
     def detect_dogs(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
         """
-        Detecta todos los perros presentes en la imagen usando un modelo YOLO
-        pre-entrenado (ej: YOLOv8n via ultralytics). No es necesario entrenar
-        el detector.
+        Detecta todos los perros presentes en una imagen BGR uint8 usando el
+        modelo YOLO preentrenado en COCO configurado en .env.
 
-        Sugerencias:
-          - self.yolo_model_name, self.conf_threshold y self.dog_class_id
-            (clase 'dog' = 16 en COCO) vienen de la configuracion (.env).
-          - Debe funcionar con un perro, multiples perros y escenas complejas.
-
-        Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
+        Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles enteros.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+            return []
+
+        yolo = self._get_yolo()
+        results = yolo(
+            image,
+            conf=self.conf_threshold,
+            classes=[self.dog_class_id],
+            verbose=False,
+        )
+
+        detections: list[tuple[tuple[int, int, int, int], float]] = []
+        if not results:
+            return detections
+
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None:
+            return detections
+
+        for box in boxes:
+            cls_id = int(box.cls[0].item())
+            conf = float(box.conf[0].item())
+            if cls_id != self.dog_class_id or conf < self.conf_threshold:
+                continue
+            coords = box.xyxy[0].tolist()
+            x1, y1, x2, y2 = (int(round(float(v))) for v in coords[:4])
+            detections.append(((x1, y1, x2, y2), conf))
+
+        return detections
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
-        Clasifica la raza del recorte de un perro detectado usando el modelo
-        entrenado en la Etapa 2 (self.classifier.load_model()).
-
-        El recorte llega en BGR (OpenCV). Retorna (raza, score).
+        Clasifica la raza de un recorte BGR uint8 usando el modelo activo de
+        Etapa 2 (.pth o .onnx) con el preprocesamiento compartido.
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
+            return ("unknown", 0.0)
+
+        model = self.classifier.load_model()
+        classes = self._resolve_classes(model)
+
+        if isinstance(model, onnxruntime.InferenceSession):
+            inp = preprocess_bgr_numpy(crop, image_size=self.classifier.image_size)
+            input_name = model.get_inputs()[0].name
+            logits = np.asarray(model.run(None, {input_name: inp})[0], dtype=np.float32).reshape(-1)
+            shifted = logits - np.max(logits)
+            exp_vals = np.exp(shifted)
+            probs = exp_vals / np.sum(exp_vals)
+            idx = int(np.argmax(probs))
+            score = float(probs[idx])
+        else:
+            device = next(model.parameters()).device
+            inp = preprocess_bgr_batch(crop, image_size=self.classifier.image_size).to(device)
+            model.eval()
+            with torch.no_grad():
+                logits = model(inp)
+                probs = torch.softmax(logits, dim=1)
+                conf_t, idx_t = torch.max(probs, dim=1)
+            idx = int(idx_t.item())
+            score = float(conf_t.item())
+
+        if settings.classifier_conf_threshold > 0.0 and score < settings.classifier_conf_threshold:
+            return ("unknown", score)
+
+        breed = classes[idx] if 0 <= idx < len(classes) else "unknown"
+        return (breed, score)
 
     # ------------------------------------------------------------------
     # Orquestacion provista

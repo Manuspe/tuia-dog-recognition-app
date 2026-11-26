@@ -8,7 +8,12 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import models
 
+from lib.config import settings
+from lib.preprocessing import l2_normalize_vector, preprocess_bgr_batch
 from lib.schemas import EmbeddingRecord, Neighbor, SearchResult
 from lib.storage.base import EmbeddingStoreProtocol
 
@@ -60,42 +65,123 @@ class SimilarityService:
     # Etapa 1: funciones a implementar
     # ------------------------------------------------------------------
 
+    def _get_baseline_backbone_name(self) -> str:
+        supported = ("resnet18", "resnet50", "efficientnet_b0", "convnext_tiny")
+        candidate = (self.model_name or "").strip().lower()
+        if candidate in supported:
+            return candidate
+        return (getattr(self, "_baseline_model_name", None) or settings.baseline_model_name).strip().lower()
+
+    def _get_backbone(self) -> tuple[nn.Module, torch.device]:
+        backbone_name = self._get_baseline_backbone_name()
+        cached = getattr(self, "_backbone", None)
+        cached_name = getattr(self, "_backbone_name", None)
+        if cached is not None and cached_name == backbone_name:
+            return cached, self._device
+
+        if backbone_name == "resnet18":
+            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            model.fc = nn.Identity()
+        elif backbone_name == "resnet50":
+            model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+            model.fc = nn.Identity()
+        elif backbone_name == "efficientnet_b0":
+            model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+            model.classifier = nn.Identity()
+        elif backbone_name == "convnext_tiny":
+            model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT)
+            model.classifier[2] = nn.Identity()
+        else:
+            raise ValueError(
+                f"Backbone baseline no soportado: '{backbone_name}'. "
+                "Opciones validas: resnet18, resnet50, efficientnet_b0, convnext_tiny."
+            )
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.eval()
+        model.to(device)
+        self._backbone = model
+        self._backbone_name = backbone_name
+        self._device = device
+        logger.info("Backbone baseline cargado (%s en %s)", backbone_name, device)
+        return model, device
+
     def extract_embedding(self, image: np.ndarray) -> list[float]:
         """
-        Genera el embedding de una imagen usando un modelo pre-entrenado en
-        ImageNet (ej: ResNet50, EfficientNet, ConvNeXt) sin la capa de
-        clasificacion final.
-
-        Sugerencias:
-          - Preprocesar la imagen (resize a self.image_size, normalizacion ImageNet).
-          - Usar torchvision.models o timm con pesos pre-entrenados.
-          - Recordar que la imagen llega en BGR (OpenCV).
-        Retorna una lista de floats de dimension EMBEDDING_DIM.
+        Genera el embedding normalizado L2 de una imagen BGR uint8 usando el
+        backbone preentrenado en ImageNet configurado sin su cabeza de clasificacion.
         """
-        raise NotImplementedError("Etapa 1: implementar extract_embedding")
+        tensor = preprocess_bgr_batch(image, image_size=self.image_size)
+        model, device = self._get_backbone()
+        model.eval()
+        with torch.no_grad():
+            emb = model(tensor.to(device))
+        vec = l2_normalize_vector(emb)
+        if len(vec) != settings.embedding_dim:
+            logger.warning(
+                "Dimension de embedding (%d) difiere de EMBEDDING_DIM (%d).",
+                len(vec),
+                settings.embedding_dim,
+            )
+        return vec
 
     def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
         """
-        Recupera de la base vectorial las top_k imagenes mas similares.
-
-        Sugerencias:
-          - Con pgvector: self.store.search(embedding, top_k).
-          - Con JSON: iterar self.store.all() y usar self.similarity(...).
-          - Respetar SIMILARITY_METRIC (cosine | l2).
-        Retorna una lista de Neighbor (path, breed, score) ordenada por score
-        descendente.
+        Recupera de la base vectorial las top_k imagenes mas similares ordenadas
+        por score descendente, soportando pgvector y almacenamiento JSON tanto
+        para metrica 'cosine' como 'l2'. No completa Neighbor.url.
         """
-        raise NotImplementedError("Etapa 1: implementar search_similar_images")
+        if top_k <= 0:
+            return []
+
+        metric = self.similarity_metric.lower()
+        search_fn = getattr(self.store, "search", None)
+        if metric == "cosine" and callable(search_fn):
+            records = search_fn(embedding, top_k)
+        else:
+            records = self.store.all()
+
+        neighbors = [
+            Neighbor(
+                path=rec.path,
+                breed=rec.breed,
+                score=round(float(self.similarity(embedding, rec.embedding)), 6),
+            )
+            for rec in records
+        ]
+        neighbors.sort(key=lambda item: item.score, reverse=True)
+        return neighbors[:top_k]
 
     def predict_breed_from_neighbors(self, results: list[Neighbor]) -> tuple[str, float]:
         """
-        Predice la raza a partir de los vecinos recuperados (ej: voto
-        mayoritario, opcionalmente ponderado por score).
+        Predice la raza mediante voto mayoritario ponderado por score entre los
+        vecinos que superan self.similarity_threshold.
 
-        Si el mejor score esta por debajo de self.similarity_threshold se
-        considera "unknown". Retorna (raza, score).
+        Si no hay vecinos o el mejor score queda por debajo del umbral, retorna
+        ("unknown", best_score). El score retornado corresponde a la similitud
+        media de los vecinos de la raza ganadora.
         """
-        raise NotImplementedError("Etapa 1: implementar predict_breed_from_neighbors")
+        if not results:
+            return ("unknown", 0.0)
+
+        best_score = max(float(item.score) for item in results)
+        if best_score < self.similarity_threshold:
+            return ("unknown", best_score)
+
+        eligible = [item for item in results if float(item.score) >= self.similarity_threshold]
+        weighted_votes: dict[str, float] = {}
+        breed_scores: dict[str, list[float]] = {}
+        for item in eligible:
+            score = float(item.score)
+            weighted_votes[item.breed] = weighted_votes.get(item.breed, 0.0) + max(score, 0.0)
+            breed_scores.setdefault(item.breed, []).append(score)
+
+        winning_breed = max(
+            weighted_votes,
+            key=lambda breed: (weighted_votes[breed], max(breed_scores[breed])),
+        )
+        mean_score = float(np.mean(breed_scores[winning_breed]))
+        return (winning_breed, mean_score)
 
     # ------------------------------------------------------------------
     # Helpers de similitud provistos
