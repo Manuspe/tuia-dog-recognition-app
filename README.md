@@ -278,31 +278,29 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 - Funciones auxiliares de evaluación (`lib/evaluation/metrics.py`) y de visualización (`lib/visualization/draw.py`).
 - Frontend Gradio con una pestaña por etapa: Etapa 1 (imagen consultada, Top-K similares, raza predicha y selección de modelo), Etapa 2 (raza y score con el modelo entrenado) y Etapa 3 (bounding boxes, razas y scores).
 
-### A implementar por el grupo
+### Implementado por el grupo
 
-Estas funciones hoy lanzan `NotImplementedError`:
-
-| Etapa | Función | Archivo |
-|-------|---------|---------|
-| 1 | `extract_embedding(image)` | `src/lib/services/similarity_service.py` |
-| 1 | `search_similar_images(embedding, top_k)` | `src/lib/services/similarity_service.py` |
-| 1 | `predict_breed_from_neighbors(results)` | `src/lib/services/similarity_service.py` |
-| 2 | `train_classifier()` | `src/lib/services/classifier_service.py` |
-| 2 | `evaluate_classifier()` | `src/lib/services/classifier_service.py` |
-| 2 | `extract_custom_embedding(image)` | `src/lib/services/classifier_service.py` |
-| 3 | `detect_dogs(image)` | `src/lib/services/detection_service.py` |
-| 3 | `classify_detected_dog(crop)` | `src/lib/services/detection_service.py` |
-
-En las Etapas 1 y 3 el trabajo se limita a completar las funciones. En la Etapa 2, además, el grupo entrena sus propios modelos (Modelo A: fine-tuning de ResNet18/ResNet50; Modelo B: CNN propia, **ambos obligatorios**) y hace un estudio de resultados.
+- **Preprocesamiento compartido (`src/lib/preprocessing.py` y `src/lib/splits.py`):** conversión explícita `BGR → RGB`, resize con **letterbox** manteniendo relación de aspecto (padding `(124, 116, 104)`), normalización ImageNet, pipeline de `albumentations` aplicado solo sobre `train` on-the-fly y carga reproducible de `data/splits.csv` (normalizando nombres como `American  Spaniel`).
+- **Etapa 1 (`src/lib/services/similarity_service.py`):**
+  - `extract_embedding`: carga lazy de backbone preentrenado (`BASELINE_MODEL_NAME=resnet18`, 512-d por defecto; configurable a `resnet50`, `efficientnet_b0`, `convnext_tiny`) + normalización L2.
+  - `search_similar_images`: búsqueda en `pgvector` (`<=>` para `cosine`) o `EmbeddingStore` JSON, soportando `cosine` y `l2` ordenados descendentemente.
+  - `predict_breed_from_neighbors`: voto mayoritario ponderado por score sobre vecinos `>= SIMILARITY_THRESHOLD`, devolviendo `"unknown"` si no hay vecinos o el mejor score queda debajo del umbral.
+- **Etapa 2 (`src/lib/services/classifier_service.py` y `src/lib/models/cnn_custom.py`):**
+  - `train_classifier`: entrenamiento reproducible con `AdamW`, `ReduceLROnPlateau`, `class_weights`, `label_smoothing`, *early stopping* sobre validación, guardado de modelo completo (`.pth`) con atributo `.classes` e historial JSON en `output/`.
+  - `evaluate_classifier`: métricas macro (`accuracy`, `precision`, `recall`, `specificity`, `f1`) usando `src/lib/evaluation/metrics.py` y exportación de detalle a `output/*_eval.json`.
+  - `extract_custom_embedding`: embeddings L2-normalizados de dimensión `EMBEDDING_DIM` (`512`) sin mutar capas del modelo cacheado.
+- **Etapa 3 (`src/lib/services/detection_service.py`):**
+  - `detect_dogs`: carga lazy de YOLO (`YOLO_MODEL` desde `.env`, comparando `yolov8n.pt` vs `yolo26n.pt` en `2-train.ipynb`) filtrando por `YOLO_DOG_CLASS_ID=16` y `YOLO_CONF_THRESHOLD`.
+  - `classify_detected_dog`: inferencia sobre cada recorte con el modelo activo (`.pth` o `.onnx`) usando el mismo preprocesamiento compartido y lista de razas guardada en el modelo.
 
 Ver el contrato de cada función, recomendaciones y errores frecuentes en [ENUNCIADO.md](ENUNCIADO.md#24-funciones-a-implementar).
 
-### Orden de trabajo sugerido
+### Orden de trabajo y ejecución
 
-1. `1-pre-processing.ipynb`: EDA, filtrado, conjunto independiente, preprocesamiento, augmentation y splits.
-2. Etapa 1 en `similarity_service.py`. Indexá la galería con `python scripts/build_index.py --split train` y probá la pestaña de la Etapa 1.
-3. Etapa 2 en `classifier_service.py`, entrenando y comparando los modelos con `2-train.ipynb`. Descargá los checkpoints a `models/`.
-4. Etapa 3 en `detection_service.py` y validación end-to-end con `docker compose up`.
+1. Ejecutar `1-pre-processing.ipynb` en Google Colab (EDA, filtrado, conjunto independiente, preprocesamiento, augmentation y guardado de `data/splits.csv`).
+2. Ejecutar `2-train.ipynb` en Google Colab con GPU T4 (evaluación Etapa 1 + calibración de umbral, entrenamiento de `resnet18_finetuned` y `cnn_custom`, análisis comparativo y comparativa `yolov8n.pt` vs `yolo26n.pt`).
+3. Descargar los checkpoints a `models/` y actualizar `.env.*.example` con el umbral calibrado y modelo ganador.
+4. Indexar la galería con `python scripts/build_index.py --split train` y validar end-to-end con `docker compose build && docker compose up`.
 
 ## Notebooks
 
@@ -315,36 +313,42 @@ Se pueden entregar commiteadas en el repositorio o en Google Colab, con el link 
 
 ## Dataset
 
-Documentar en la entrega final:
-
-- Splits utilizados y cantidad de imágenes por raza en cada uno
-- Reglas de filtrado y calidad, con la cantidad de imágenes descartadas por regla
-- Conjunto independiente de evaluación: fuente, licencia, razas e imágenes por raza, y link de descarga
-- Preprocesamiento y data augmentation aplicados
+- **Dataset principal:** *70 Dog Breeds Image Dataset* (70 razas; splits `train/`, `valid/`, `test/`). Se descarga con `python scripts/download_dataset.py` y se filtra en `1-pre-processing.ipynb` generando `data/splits.csv` (incluyendo normalización del nombre `valid/American  Spaniel`).
+- **Conteos por split y descartes por regla:** de **9.346** imágenes originales se descartaron **234** (86 casi-duplicados `dHash <= 3`, 43 duplicados exactos intra-split `SHA256`, 1 exposición extrema, 28 fugas inter-split `dHash` y 76 fugas inter-split `SHA256`), resultando **0 intersecciones** entre splits finales: `train=7.729`, `valid=687`, `test=696` (70 razas).
+- **Conjunto independiente de evaluación:** **157 imágenes** totales (`125` de perro único en **25 razas** —5 por raza—, `17` escenas complejas/multi-perro y `15` sin perros), con **0 solapamiento** (`SHA256` y `dHash <= 3`) contra el dataset principal. Fuentes documentadas en `data/independent_sources.csv` (91 Stanford Dogs / ImageNet y 66 Unsplash License) y descarga pública en [Google Drive (`TP2_Perros`)](https://drive.google.com/drive/folders/1zHdSnTbOOp2r2IEwy-BI2DZDG3H6cmvy?usp=sharing).
+- **Preprocesamiento y augmentation:** *letterbox* a `224×224` preservando relación de aspecto (padding `(124, 116, 104)`), normalización ImageNet (`BGR→RGB`) y aumentaciones on-the-fly (`HorizontalFlip`, `Affine` leve, `RandomBrightnessContrast`, `HueSaturationValue`, `GaussianBlur`, `GaussNoise`) aplicadas únicamente sobre `train`.
 
 ## Modelos y entrenamiento
 
-Completar en la entrega final:
-
-- Modelo de embeddings baseline (Etapa 1) y justificación
-- Modelo A (fine-tuning) y Modelo B (CNN propia): arquitectura, estrategia y justificación
-- Hiperparámetros y proceso de entrenamiento
-- Detector YOLO utilizado y `YOLO_CONF_THRESHOLD` elegido
-- Umbral de similitud elegido y cómo se calibró
-- Links públicos de descarga de los checkpoints
+- **Baseline Etapa 1 (`EMBEDDING_MODEL=baseline`):** `ResNet18` preentrenado en ImageNet (`512-d`, `EMBEDDING_DIM=512`), compatible dimensionalmente sin re-esquematizar la base vectorial al cambiar entre `baseline`, `resnet18_finetuned` y `cnn_custom`.
+- **Modelo A (`resnet18_finetuned`):** `ResNet18` preentrenado con reemplazo de `fc` a 70 clases, comparando estrategia `head_only` vs `partial` (`layer4 + fc` con LR diferenciado, `AdamW`, `weight_decay=1e-4`, `label_smoothing=0.1`, `class_weights`, *early stopping*).
+- **Modelo B (`cnn_custom`):** `CNNCustom` residual en `src/lib/models/cnn_custom.py` (4 etapas `64→128→256→512`, GAP, embedding 512-d, Dropout `0.4`), comparada en tabla de experimentos contra `CNNCustomSimple` sin conexiones residuales.
+- **Detector YOLO (Etapa 3):** comparativa `yolov8n.pt` (19 detecciones en 8 escenas, 0 FP en 8 imágenes sin perros, 6.2 MB, `369.92 ms/img` CPU) vs `yolo26n.pt` (20 detecciones, 0 FP, 5.3 MB, `375.90 ms/img` CPU); modelo elegido: **`models/yolo26n.pt`**, `YOLO_CONF_THRESHOLD=0.25`.
+- **Umbral de similitud:** calibrado conjuntamente sobre `valid` e `independent_no_dogs` (`SIMILARITY_THRESHOLD=0.80`, con `EMBEDDING_MODEL=resnet18_finetuned`, manteniendo `95.34%` en `valid` con `0%` de `"unknown"` y rechazando el `86.67%` de imágenes sin perros).
+- **Links públicos de checkpoints y datos (solo lectura):** carpeta compartida en [Google Drive (`TP2_Perros`)](https://drive.google.com/drive/folders/1zHdSnTbOOp2r2IEwy-BI2DZDG3H6cmvy?usp=sharing) (contiene `resnet18_finetuned.pth`, `cnn_custom.pth` e `independent_dataset.zip`).
 
 ## Resultados
 
-Completar en la entrega final:
+- **Etapa 1 (`NDCG@10`, `Precision@10`, `Accuracy` en `test` e independiente):**
+  - **Baseline (`ResNet18` ImageNet, `th=0.80`):** `test`: `NDCG@10 = 0.8739`, `P@10 = 0.8603`, `Acc = 93.10%` | `independent`: `NDCG@10 = 0.6953`, `P@10 = 0.6904`, `Acc = 74.40%`.
+  - **`resnet18_finetuned` (`th=0.80`, elegido):** `test`: **`NDCG@10 = 0.9565`**, **`P@10 = 0.9543`**, **`Acc = 96.41%`** | `independent`: `NDCG@10 = 0.6968`, `Acc = 68.00%`.
+  - **`cnn_custom` (`th=0.75`):** `test`: `NDCG@10 = 0.8584`, `P@10 = 0.8546`, `Acc = 88.22%` | `independent`: `NDCG@10 = 0.3174`, `Acc = 33.60%`.
+- **Etapa 2 (Modelo A vs Modelo B en `test`, `independent` y costo CPU):**
 
-- Etapa 1: NDCG@10 por modelo de embeddings, sobre `test` y sobre el conjunto independiente
-- Etapa 2: accuracy, precision, recall, specificity y F1 de ambos modelos, y matriz de confusión
-- Comparación entre enfoques (búsqueda por similitud vs. clasificación supervisada; fine-tuning vs. CNN propia)
-- Análisis de errores (falsos positivos y falsos negativos)
+| Modelo | Acc (`test`) | F1 (`test`) | Acc (`indep`) | F1 (`indep`) | Params | Tamaño | CPU (`ms/img`) |
+|---|---|---|---|---|---|---|---|
+| `resnet18_finetuned` (`partial`) | **95.40%** | **0.9524** | **67.20%** | **0.7301** | 11,212,422 | 42.86 MB | 20.62 ms |
+| `cnn_custom` (residual desde cero) | 86.93% | 0.8696 | 30.40% | 0.3530 | 11,212,422 | 42.86 MB | 20.93 ms |
+
+  *(Referencias previas en `test`: `ResNet18 head_only = 92.82%` / `F1 = 0.9269`; `CNNCustomSimple` 10 épocas = `39.37%`. En `resnet18_finetuned` `specificity = 0.9993` en `test` y `0.9963` en `independent`.)*
+- **Comparación entre enfoques y análisis de errores (FP/FN):** la clasificación supervisada (`resnet18_finetuned`) obtiene fronteras discriminativas estables en latencia $O(1)$ (`95.40%`), mientras que la búsqueda por similitud aporta explicabilidad visual (Top-K vecinos) y extensibilidad sin reentrenamiento (`NDCG@10 = 0.9565` con embeddings fine-tuned). Las confusiones principales ocurren entre razas morfológicamente cercanas (`American Spaniel ↔ Irish Spaniel`, `Bulldog ↔ Boston Terrier`, `Malinois ↔ German Sheperd`, `Yorkie ↔ Cairn`), y la caída en el conjunto independiente (`95.40% → 67.20%` y `86.93% → 30.40%`) evidencia el cambio de dominio y la mayor capacidad de generalización del preentrenamiento en ImageNet frente al entrenamiento desde cero.
 
 ## Problemas encontrados y soluciones
 
-Completar en la entrega final.
+- **Doble espacio en carpeta de Kaggle (`valid/American  Spaniel`):** el dataset original difiere en el nombre respecto a `train`/`test`, desalineando índices de `ImageFolder`. Se normalizó mediante `normalize_breed_name` en `src/lib/splits.py` y se renombra automáticamente en las notebooks.
+- **Paridad de preprocesamiento entre entrenamiento e inferencia:** se encapsuló el *letterbox* y normalización ImageNet en `src/lib/preprocessing.py` para evitar inconsistencias `BGR/RGB` o recortes agresivos sobre crops de YOLO.
+- **Portabilidad de checkpoints en Docker sin dataset:** los checkpoints `.pth` guardan el modelo completo (importable desde `lib.models.cnn_custom`) junto con la lista ordenada `model.classes`.
+- **Solapamiento del conjunto independiente y calibración de umbral:** la auditoría `dHash` en `1-pre-processing.ipynb` detectó 34 casi-duplicados provenientes de Stanford Dogs dentro del dataset de Kaggle, los cuales fueron reemplazados por imágenes de Unsplash hasta verificar **0 duplicados**. Asimismo, calibrar `SIMILARITY_THRESHOLD` conjuntamente sobre `valid` e `independent_no_dogs` evitó un umbral trivial (`0.30`) y permitió fijarlo en `0.80` (notando que la métrica `l2` mantiene idéntico `NDCG@10` pero requiere su propia escala de umbral distinta a `cosine`).
 
 ## Notas importantes
 
