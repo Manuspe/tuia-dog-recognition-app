@@ -85,7 +85,7 @@ tqdm==4.67.3
 typer==0.24.1
 typing-extensions==4.15.0
 typing-inspection==0.4.2
-ultralytics>=8.3
+ultralytics>=8.4.0
 urllib3==2.6.3
 uvicorn==0.44.0
 uvloop==0.22.1; sys_platform != 'win32'
